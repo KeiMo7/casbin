@@ -54,6 +54,7 @@ func NewCachedEnforcer(params ...interface{}) (*CachedEnforcer, error) {
 	e.cache, _ = cache.NewDefaultCache()
 	e.locker = new(sync.RWMutex)
 	e.cacheVersion = e.getPolicyVersion()
+	e.Enforcer.cacheInvalidator = e.invalidateCacheForModelSwitch
 	return e, nil
 }
 
@@ -152,7 +153,19 @@ func (e *CachedEnforcer) SetCache(c cache.Cache) {
 }
 
 func (e *CachedEnforcer) getKey(params ...interface{}) (string, bool) {
-	return GetCacheKey(params...)
+	key, ok := GetCacheKey(params...)
+	if !ok {
+		return "", false
+	}
+	return strconv.FormatUint(e.GetModelGeneration(), 10) + ":" +
+		strconv.FormatUint(e.getPolicyVersion(), 10) + ":" + key, true
+}
+
+func (e *CachedEnforcer) invalidateCacheForModelSwitch() {
+	e.locker.Lock()
+	defer e.locker.Unlock()
+	_ = e.cache.Clear()
+	e.cacheVersion = e.getPolicyVersion()
 }
 
 // InvalidateCache deletes all the existing cached decisions.

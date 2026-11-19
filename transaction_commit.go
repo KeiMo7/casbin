@@ -255,6 +255,7 @@ func (tx *Transaction) applyOperationsToModel() error {
 	// Replace the enforcer's model.
 	tx.enforcer.model = newModel
 	tx.enforcer.invalidateMatcherMap()
+	tx.enforcer.publishState()
 
 	// Rebuild role links if necessary.
 	if tx.enforcer.autoBuildRoleLinks {

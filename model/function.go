@@ -67,3 +67,17 @@ func (fm *FunctionMap) GetFunctions() map[string]govaluate.ExpressionFunction {
 
 	return ret
 }
+
+// Clone returns an independent function map containing the built-in functions
+// and all functions registered on the receiver.
+func (fm *FunctionMap) Clone() FunctionMap {
+	cloned := LoadFunctionMap()
+	if fm == nil || fm.fns == nil {
+		return cloned
+	}
+	fm.fns.Range(func(key interface{}, value interface{}) bool {
+		cloned.AddFunction(key.(string), value.(govaluate.ExpressionFunction))
+		return true
+	})
+	return cloned
+}

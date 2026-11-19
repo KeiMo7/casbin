@@ -125,8 +125,8 @@ func (e *Enforcer) RemovePolicyIndex(ptype string) {
 	e.policyIndexes.Delete(ptype)
 }
 
-func (e *Enforcer) getPolicyIndex(ptype string) *policyIndex {
-	if value, ok := e.policyIndexes.Load(ptype); ok {
+func (e *Enforcer) getPolicyIndex(state *enforcementState, ptype string) *policyIndex {
+	if value, ok := state.policyIndexes.Load(ptype); ok {
 		return value.(*policyIndex)
 	}
 	return nil

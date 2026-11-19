@@ -18,6 +18,8 @@
 package casbin
 
 import (
+	"context"
+
 	"github.com/casbin/casbin/v3/effector"
 	"github.com/casbin/casbin/v3/model"
 	"github.com/casbin/casbin/v3/persist"
@@ -38,6 +40,18 @@ type IEnforcer interface {
 	InitWithAdapter(modelPath string, adapter persist.Adapter) error
 	InitWithModelAndAdapter(m model.Model, adapter persist.Adapter) error
 	LoadModel() error
+	HotReloadModel(ctx context.Context, modelPath string, opts ...ModelUpdateOption) (*ModelUpdateReport, error)
+	HotReloadModelFromText(ctx context.Context, text string, opts ...ModelUpdateOption) (*ModelUpdateReport, error)
+	ValidateModelUpdate(ctx context.Context, text string, opts ...ModelUpdateOption) (*ModelUpdateReport, error)
+	GetModelVersion() string
+	GetModelGeneration() uint64
+	GetModelUpdateHistory() []ModelUpdateReport
+	GetModelAuditHistory() []ModelAuditRecord
+	SetModelUpdateAlerter(alerter ModelUpdateAlerter)
+	ApplyPolicyBatch(ctx context.Context, operations []PolicyBatchOperation) (*PolicyBatchResult, error)
+	AddPoliciesAtomic(rules [][]string) (bool, error)
+	GetModelVisualization() string
+	ExportModelGraph(format ModelGraphFormat) (string, error)
 	GetModel() model.Model
 	SetModel(m model.Model)
 	GetAdapter() persist.Adapter
@@ -59,6 +73,7 @@ type IEnforcer interface {
 	EnableAutoBuildRoleLinks(autoBuildRoleLinks bool)
 	BuildRoleLinks() error
 	Enforce(rvals ...interface{}) (bool, error)
+	EnforceWithTrace(rvals ...interface{}) (bool, *EnforcementTrace, error)
 	EnforceWithMatcher(matcher string, rvals ...interface{}) (bool, error)
 	EnforceEx(rvals ...interface{}) (bool, []string, error)
 	EnforceExWithMatcher(matcher string, rvals ...interface{}) (bool, []string, error)

@@ -18,6 +18,7 @@
 package casbin
 
 import (
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +50,7 @@ func NewSyncedCachedEnforcer(params ...interface{}) (*SyncedCachedEnforcer, erro
 	e.cache, _ = cache.NewSyncCache()
 	e.locker = new(sync.RWMutex)
 	e.cacheVersion = e.getPolicyVersion()
+	e.Enforcer.cacheInvalidator = e.invalidateCacheForModelSwitch
 	return e, nil
 }
 
@@ -148,7 +150,19 @@ func (e *SyncedCachedEnforcer) SetCache(c cache.Cache) {
 }
 
 func (e *SyncedCachedEnforcer) getKey(params ...interface{}) (string, bool) {
-	return GetCacheKey(params...)
+	key, ok := GetCacheKey(params...)
+	if !ok {
+		return "", false
+	}
+	return strconv.FormatUint(e.GetModelGeneration(), 10) + ":" +
+		strconv.FormatUint(e.getPolicyVersion(), 10) + ":" + key, true
+}
+
+func (e *SyncedCachedEnforcer) invalidateCacheForModelSwitch() {
+	e.locker.Lock()
+	defer e.locker.Unlock()
+	_ = e.cache.Clear()
+	atomic.StoreUint64(&e.cacheVersion, e.getPolicyVersion())
 }
 
 // InvalidateCache deletes all the existing cached decisions.

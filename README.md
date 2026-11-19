@@ -58,6 +58,7 @@ Apache Casbin is a powerful and efficient open-source access control library for
 - [Online editor](#online-editor)
 - [Tutorials](#tutorials)
 - [Get started](#get-started)
+- [Safe model hot reload](#safe-model-hot-reload)
 - [Policy management](#policy-management)
 - [Policy persistence](#policy-persistence)
 - [Policy consistence between multiple nodes](#policy-consistence-between-multiple-nodes)
@@ -206,6 +207,55 @@ Note: `Enforcer` is not safe for concurrent use. If the enforcer is shared by mu
     ```
 
 See [Policy management APIs](#policy-management) for more usage.
+
+## Safe model hot reload
+
+Use `HotReloadModel` or `HotReloadModelFromText` when a model change must not
+restart the service:
+
+```go
+report, err := e.HotReloadModelFromText(ctx, modelText,
+    casbin.WithModelUpdateTimeout(2*time.Second),
+    casbin.WithModelUpdateAuditSink(auditSink),
+)
+if err != nil {
+    // The old model is still active. report contains validation/switch timing,
+    // rejected issues, and before/after decision comparisons.
+}
+```
+
+The candidate is parsed and semantically checked before publication. Existing
+policies are validated against the new `p`/`g` definitions, role links are
+rebuilt in isolation, and matchers are compiled with the same evaluation engine
+used by `Enforce`. A failed validation, timeout, or concurrent update leaves the
+old model untouched and invokes the configured alerter.
+
+Every report contains the immutable model version, validation duration, switch
+timestamp, the same requests evaluated against both models, tightened existing
+grants, and loosened grants. Loosening also creates a `ModelAuditRecord`; use
+`WithModelUpdateAuditSink` to persist it. `EnforceWithTrace` and structured log
+entries expose the exact model version used by a decision. Decision caches
+include both the model generation and policy version, and are cleared on switch.
+
+`[role_names]`, `[user_names]`, and `[resource_names]` are optional semantic
+sections. When present, policy rules are rejected if they reference a role,
+user, or resource that is not declared (or established by `g`/`g2` grouping).
+
+Policy batches are atomic through `ApplyPolicyBatch` or
+`AddPoliciesAtomic`. The entire batch is applied to a private model snapshot and
+published only after every rule, role link, and constraint succeeds.
+
+Model graphs can be exported for review:
+
+```go
+mermaid, _ := e.ExportModelGraph(casbin.ModelGraphMermaid)
+dot, _ := e.ExportModelGraph(casbin.ModelGraphDOT)
+```
+
+`[model_format] version = N` and `min_reader_version = N` provide an explicit
+rolling-upgrade envelope. An instance that cannot read the required format
+rejects the update with `ErrUnsupportedModelSyntax` instead of partially loading
+it.
 
 ## Policy management
 

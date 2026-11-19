@@ -57,6 +57,8 @@ type LogEntry struct {
 	Rules [][]string
 	// RuleCount is the number of rules affected by the operation.
 	RuleCount int
+	// ModelVersion is the immutable model version used by an enforce operation.
+	ModelVersion string
 
 	// Error contains any error that occurred during the event.
 	Error error

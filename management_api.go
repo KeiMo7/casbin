@@ -141,7 +141,7 @@ func (e *Enforcer) GetFilteredNamedPolicyWithMatcher(ptype string, matcher strin
 	var res [][]string
 	var err error
 
-	functions := e.getMatcherFunctions()
+	functions := e.getMatcherFunctions(e.currentState())
 
 	var expString string
 	if matcher == "" {

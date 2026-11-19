@@ -47,6 +47,11 @@ func NewSyncedEnforcer(params ...interface{}) (*SyncedEnforcer, error) {
 
 	e.stopAutoLoad = make(chan struct{}, 1)
 	e.autoLoadRunning = 0
+	e.Enforcer.switchGuard = func(fn func()) {
+		e.m.Lock()
+		defer e.m.Unlock()
+		fn()
+	}
 	return e, nil
 }
 

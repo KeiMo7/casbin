@@ -18,8 +18,10 @@
 package casbin
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -48,14 +50,26 @@ type Enforcer struct {
 	fm        model.FunctionMap
 	eft       effector.Effector
 
+	state              atomic.Value
+	stateMu            sync.RWMutex
+	modelVersion       string
+	modelGeneration    uint64
+	switchGuard        func(func())
+	modelUpdateMu      sync.Mutex
+	modelUpdateHistory []ModelUpdateReport
+	modelAuditHistory  []ModelAuditRecord
+	modelAuditMu       sync.RWMutex
+	modelUpdateAlerter ModelUpdateAlerter
+	cacheInvalidator   func()
+
 	adapter       persist.Adapter
 	watcher       persist.Watcher
 	dispatcher    persist.Dispatcher
 	rmMap         map[string]rbac.RoleManager
 	condRmMap     map[string]rbac.ConditionalRoleManager
-	matcherMap    sync.Map
-	policyIndexes sync.Map
-	denyCache     sync.Map
+	matcherMap    *sync.Map
+	policyIndexes *sync.Map
+	denyCache     *sync.Map
 	logger        log.Logger
 	detectors     []detector.Detector
 
@@ -68,6 +82,19 @@ type Enforcer struct {
 	gFunctionCache       bool
 
 	aiConfig AIConfig
+}
+
+type enforcementState struct {
+	model           model.Model
+	fm              model.FunctionMap
+	eft             effector.Effector
+	rmMap           map[string]rbac.RoleManager
+	condRmMap       map[string]rbac.ConditionalRoleManager
+	matcherMap      *sync.Map
+	policyIndexes   *sync.Map
+	denyCache       *sync.Map
+	modelVersion    string
+	modelGeneration uint64
 }
 
 // EnforceContext is used as the first element of the parameter "rvals" in method "enforce".
@@ -203,7 +230,9 @@ func (e *Enforcer) initialize() {
 	e.condRmMap = map[string]rbac.ConditionalRoleManager{}
 	e.eft = effector.NewDefaultEffector()
 	e.watcher = nil
-	e.matcherMap = sync.Map{}
+	e.matcherMap = &sync.Map{}
+	e.policyIndexes = &sync.Map{}
+	e.denyCache = &sync.Map{}
 	e.bumpPolicyVersion()
 
 	e.enabled = true
@@ -218,23 +247,23 @@ func (e *Enforcer) initialize() {
 	if e.detectors == nil {
 		e.detectors = []detector.Detector{detector.NewDefaultDetector()}
 	}
+
+	e.publishState()
 }
 
 // LoadModel reloads the model from the model CONF file.
 // Because the policy is attached to a model, so the policy is invalidated and needs to be reloaded by calling LoadPolicy().
 func (e *Enforcer) LoadModel() error {
-	var err error
-	e.model, err = model.NewModelFromFile(e.modelPath)
+	if e.modelPath == "" {
+		return errors.New("model path is empty")
+	}
+
+	text, err := os.ReadFile(e.modelPath)
 	if err != nil {
 		return err
 	}
-
-	e.model.PrintModel()
-	e.fm = model.LoadFunctionMap()
-
-	e.initialize()
-
-	return nil
+	_, err = e.HotReloadModelFromText(context.Background(), string(text))
+	return err
 }
 
 // GetModel gets the current model.
@@ -310,6 +339,7 @@ func (e *Enforcer) SetNamedRoleManager(ptype string, rm rbac.RoleManager) {
 // SetEffector sets the current effector.
 func (e *Enforcer) SetEffector(eft effector.Effector) {
 	e.eft = eft
+	e.publishState()
 }
 
 // SetLogger sets the logger for the enforcer.
@@ -462,6 +492,7 @@ func (e *Enforcer) applyModifiedModel(newModel model.Model) error {
 	e.model = newModel
 	e.resetPolicyCaches()
 	e.invalidateMatcherMap()
+	e.publishState()
 	return nil
 }
 
@@ -718,11 +749,17 @@ func NewEnforceContext(suffix string) EnforceContext {
 }
 
 func (e *Enforcer) invalidateMatcherMap() {
-	e.matcherMap = sync.Map{}
+	clearSyncMap(e.matcherMap)
 	e.bumpPolicyVersion()
 }
 
 func (e *Enforcer) resetPolicyCaches() {
+	if e.policyIndexes == nil {
+		e.policyIndexes = &sync.Map{}
+	}
+	if e.denyCache == nil {
+		e.denyCache = &sync.Map{}
+	}
 	e.policyIndexes.Range(func(_, value interface{}) bool {
 		value.(*policyIndex).reset()
 		return true
@@ -739,9 +776,9 @@ type denyCacheEntry struct {
 	allValid bool
 }
 
-func (e *Enforcer) policyHasDeny(pType string, pTokens map[string]int) (bool, bool) {
-	ast := e.model["p"][pType]
-	if value, ok := e.denyCache.Load(pType); ok {
+func (e *Enforcer) policyHasDeny(state *enforcementState, pType string, pTokens map[string]int) (bool, bool) {
+	ast := state.model["p"][pType]
+	if value, ok := state.denyCache.Load(pType); ok {
 		entry := value.(denyCacheEntry)
 		if entry.version == ast.PolicyVersion {
 			return entry.hasDeny, entry.allValid
@@ -759,19 +796,19 @@ func (e *Enforcer) policyHasDeny(pType string, pTokens map[string]int) (bool, bo
 		}
 	}
 
-	e.denyCache.Store(pType, denyCacheEntry{version: ast.PolicyVersion, hasDeny: hasDeny, allValid: allValid})
+	state.denyCache.Store(pType, denyCacheEntry{version: ast.PolicyVersion, hasDeny: hasDeny, allValid: allValid})
 	return hasDeny, allValid
 }
 
-func (e *Enforcer) effectiveEffectExpr(pType string, pTokens map[string]int, effectExpr string, policyLen int, matcherUsesPolicy bool) string {
+func (e *Enforcer) effectiveEffectExpr(state *enforcementState, pType string, pTokens map[string]int, effectExpr string, policyLen int, matcherUsesPolicy bool) string {
 	if policyLen == 0 || !matcherUsesPolicy || effectExpr != constant.AllowAndDenyEffect {
 		return effectExpr
 	}
-	if _, ok := e.eft.(*effector.DefaultEffector); !ok {
+	if _, ok := state.eft.(*effector.DefaultEffector); !ok {
 		return effectExpr
 	}
 
-	hasDeny, allValid := e.policyHasDeny(pType, pTokens)
+	hasDeny, allValid := e.policyHasDeny(state, pType, pTokens)
 	if !allValid || hasDeny {
 		return effectExpr
 	}
@@ -787,8 +824,15 @@ func (e *Enforcer) bumpPolicyVersion() {
 }
 
 // enforce use a custom matcher to decides whether a "subject" can access a "object" with the operation "action", input parameters are usually: (matcher, sub, obj, act), use model matcher by default when matcher is "".
-func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interface{}) (ok bool, err error) { //nolint:funlen,cyclop,gocyclo // TODO: reduce function complexity
+func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interface{}) (bool, error) {
+	return e.enforceWithState(e.currentState(), matcher, explains, rvals...)
+}
+
+func (e *Enforcer) enforceWithState(state *enforcementState, matcher string, explains *[]string, rvals ...interface{}) (ok bool, err error) { //nolint:funlen,cyclop,gocyclo // TODO: reduce function complexity
 	logEntry := e.onLogBeforeEventInEnforce(rvals)
+	if logEntry != nil {
+		logEntry.ModelVersion = state.modelVersion
+	}
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -826,18 +870,18 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 
 	var expString string
 	if matcher == "" {
-		expString = e.model["m"][mType].Value
+		expString = state.model["m"][mType].Value
 	} else {
 		// For custom matchers provided at runtime, escape backslashes in string literals
 		expString = util.EscapeStringLiterals(util.RemoveComments(util.EscapeAssertion(matcher)))
 	}
 
-	rTokens := make(map[string]int, len(e.model["r"][rType].Tokens))
-	for i, token := range e.model["r"][rType].Tokens {
+	rTokens := make(map[string]int, len(state.model["r"][rType].Tokens))
+	for i, token := range state.model["r"][rType].Tokens {
 		rTokens[token] = i
 	}
-	pTokens := make(map[string]int, len(e.model["p"][pType].Tokens))
-	for i, token := range e.model["p"][pType].Tokens {
+	pTokens := make(map[string]int, len(state.model["p"][pType].Tokens))
+	for i, token := range state.model["p"][pType].Tokens {
 		pTokens[token] = i
 	}
 
@@ -869,28 +913,28 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 
 	hasEval := util.HasEval(expString)
 	var expression *govaluate.EvaluableExpression
-	expression, err = e.getAndStoreMatcherExpression(hasEval, expString, &parameters)
+	expression, err = e.getAndStoreMatcherExpression(state, hasEval, expString, &parameters)
 	if err != nil {
 		return false, err
 	}
 
-	if len(e.model["r"][rType].Tokens) != len(rvals) {
+	if len(state.model["r"][rType].Tokens) != len(rvals) {
 		return false, fmt.Errorf(
 			"invalid request size: expected %d, got %d, rvals: %v",
-			len(e.model["r"][rType].Tokens),
+			len(state.model["r"][rType].Tokens),
 			len(rvals),
 			rvals)
 	}
 
-	policyLen := len(e.model["p"][pType].Policy)
+	policyLen := len(state.model["p"][pType].Policy)
 	matcherUsesPolicy := strings.Contains(expString, pType+"_")
-	effectExpr := e.effectiveEffectExpr(pType, pTokens, e.model["e"][eType].Value, policyLen, matcherUsesPolicy)
+	effectExpr := e.effectiveEffectExpr(state, pType, pTokens, state.model["e"][eType].Value, policyLen, matcherUsesPolicy)
 
 	var bucketIDs []uint32
 	var requestBucket uint32
 	var usePolicyIndex bool
-	if pIndex := e.getPolicyIndex(pType); pIndex != nil {
-		bucketIDs = pIndex.ensureBuilt(e.model["p"][pType])
+	if pIndex := e.getPolicyIndex(state, pType); pIndex != nil {
+		bucketIDs = pIndex.ensureBuilt(state.model["p"][pType])
 		requestBucket, usePolicyIndex = pIndex.requestBucket(rvals)
 	}
 
@@ -904,12 +948,12 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		policyEffects = make([]effector.Effect, policyLen)
 		matcherResults = make([]float64, policyLen)
 
-		for policyIndex, pvals := range e.model["p"][pType].Policy {
+		for policyIndex, pvals := range state.model["p"][pType].Policy {
 			// log.LogPrint("Policy Rule: ", pvals)
-			if len(e.model["p"][pType].Tokens) != len(pvals) {
+			if len(state.model["p"][pType].Tokens) != len(pvals) {
 				return false, fmt.Errorf(
 					"invalid policy size: expected %d, got %d, pvals: %v",
-					len(e.model["p"][pType].Tokens),
+					len(state.model["p"][pType].Tokens),
 					len(pvals),
 					pvals)
 			}
@@ -931,7 +975,7 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 			// set to no-match at first
 			matcherResults[policyIndex] = 0
 			if usePolicyIndex && !policyMatchesBucket(bucketIDs, policyIndex, requestBucket) {
-				effect, explainIndex, err = e.eft.MergeEffects(effectExpr, policyEffects, matcherResults, policyIndex, policyLen)
+				effect, explainIndex, err = state.eft.MergeEffects(effectExpr, policyEffects, matcherResults, policyIndex, policyLen)
 				if err != nil {
 					return false, err
 				}
@@ -966,7 +1010,7 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 			//	break
 			// }
 
-			effect, explainIndex, err = e.eft.MergeEffects(effectExpr, policyEffects, matcherResults, policyIndex, policyLen)
+			effect, explainIndex, err = state.eft.MergeEffects(effectExpr, policyEffects, matcherResults, policyIndex, policyLen)
 			if err != nil {
 				return false, err
 			}
@@ -975,7 +1019,7 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 			}
 		}
 	} else {
-		if hasEval && len(e.model["p"][pType].Policy) == 0 {
+		if hasEval && len(state.model["p"][pType].Policy) == 0 {
 			return false, errors.New("please make sure rule exists in policy when using eval() in matcher")
 		}
 
@@ -996,15 +1040,15 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 			policyEffects[0] = effector.Indeterminate
 		}
 
-		effect, explainIndex, err = e.eft.MergeEffects(effectExpr, policyEffects, matcherResults, 0, 1)
+		effect, explainIndex, err = state.eft.MergeEffects(effectExpr, policyEffects, matcherResults, 0, 1)
 		if err != nil {
 			return false, err
 		}
 	}
 
 	if explains != nil {
-		if explainIndex != -1 && len(e.model["p"][pType].Policy) > explainIndex {
-			*explains = e.model["p"][pType].Policy[explainIndex]
+		if explainIndex != -1 && len(state.model["p"][pType].Policy) > explainIndex {
+			*explains = state.model["p"][pType].Policy[explainIndex]
 		}
 	}
 
@@ -1014,10 +1058,10 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 	return result, nil
 }
 
-func (e *Enforcer) getMatcherFunctions() map[string]govaluate.ExpressionFunction {
-	functions := e.fm.GetFunctions()
-	if _, ok := e.model["g"]; ok {
-		for key, ast := range e.model["g"] {
+func (e *Enforcer) getMatcherFunctions(state *enforcementState) map[string]govaluate.ExpressionFunction {
+	functions := state.fm.GetFunctions()
+	if _, ok := state.model["g"]; ok {
+		for key, ast := range state.model["g"] {
 			// g must be a normal role definition (ast.RM != nil)
 			//   or a conditional role definition (ast.CondRM != nil)
 			// ast.RM and ast.CondRM shouldn't be nil at the same time
@@ -1032,14 +1076,14 @@ func (e *Enforcer) getMatcherFunctions() map[string]govaluate.ExpressionFunction
 	return functions
 }
 
-func (e *Enforcer) getAndStoreMatcherExpression(hasEval bool, expString string, parameters *enforceParameters) (*govaluate.EvaluableExpression, error) {
+func (e *Enforcer) getAndStoreMatcherExpression(state *enforcementState, hasEval bool, expString string, parameters *enforceParameters) (*govaluate.EvaluableExpression, error) {
 	if !hasEval {
-		if cachedExpression, ok := e.matcherMap.Load(expString); ok {
+		if cachedExpression, ok := state.matcherMap.Load(expString); ok {
 			return cachedExpression.(*govaluate.EvaluableExpression), nil
 		}
 	}
 
-	functions := e.getMatcherFunctions()
+	functions := e.getMatcherFunctions(state)
 	if hasEval {
 		functions["eval"] = generateEvalFunction(functions, parameters)
 	}
@@ -1047,7 +1091,7 @@ func (e *Enforcer) getAndStoreMatcherExpression(hasEval bool, expString string, 
 	if err != nil {
 		return nil, err
 	}
-	e.matcherMap.Store(expString, expression)
+	state.matcherMap.Store(expString, expression)
 	return expression, nil
 }
 
