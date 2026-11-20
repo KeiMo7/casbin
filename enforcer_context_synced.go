@@ -17,7 +17,10 @@
 
 package casbin
 
-import "context"
+import (
+	"context"
+	"sync/atomic"
+)
 
 var _ IEnforcerContext = &SyncedContextEnforcer{}
 
@@ -35,12 +38,19 @@ func NewSyncedContextEnforcer(params ...interface{}) (*SyncedContextEnforcer, er
 	}
 
 	ctxEnforcer := e.(*ContextEnforcer)
+	se := &SyncedEnforcer{
+		Enforcer: ctxEnforcer.Enforcer,
+	}
+	se.initReconcileState()
+	se.appliedFingerprint = policyFingerprint(se.model)
+	se.lastSyncedRevision = se.getLocalRevision()
+	if v, versioned, verr := adapterStorageVersion(se.adapter); versioned && verr == nil {
+		se.appliedVersion = v
+		se.latestVersion = v
+	}
 	return &SyncedContextEnforcer{
-		SyncedEnforcer: &SyncedEnforcer{
-			Enforcer:     ctxEnforcer.Enforcer,
-			stopAutoLoad: make(chan struct{}, 1),
-		},
-		ctxEnforcer: ctxEnforcer,
+		SyncedEnforcer: se,
+		ctxEnforcer:    ctxEnforcer,
 	}, nil
 }
 
@@ -54,7 +64,22 @@ func (e *SyncedContextEnforcer) LoadPolicyCtx(ctx context.Context) error {
 	}
 	e.m.Lock()
 	defer e.m.Unlock()
-	return e.applyModifiedModel(newModel)
+	if err := e.applyModifiedModel(newModel); err != nil {
+		return err
+	}
+	// Keep convergence bookkeeping consistent with the manually applied
+	// storage state so the reconciler cannot mistake it for a local mutation.
+	atomic.StoreUint64(&e.appliedFingerprint, policyFingerprint(newModel))
+	atomic.StoreUint64(&e.lastSyncedRevision, e.getLocalRevision())
+	if v, versioned, verr := adapterStorageVersion(e.adapter); versioned && verr == nil &&
+		v >= atomic.LoadUint64(&e.appliedVersion) {
+		atomic.StoreUint64(&e.appliedVersion, v)
+		if v > atomic.LoadUint64(&e.latestVersion) {
+			atomic.StoreUint64(&e.latestVersion, v)
+		}
+	}
+	e.recordSuccess()
+	return nil
 }
 
 // LoadFilteredPolicyCtx loads all policy rules from the storage with context and filter with synchronization.

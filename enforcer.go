@@ -42,6 +42,13 @@ import (
 // Enforcer is the main interface for authorization enforcement and policy management.
 type Enforcer struct {
 	policyVersion uint64
+	// localRevision increments on every in-memory policy change (local
+	// mutations and storage-driven reloads alike). Convergence machinery
+	// compares it against the revision captured at the last storage sync
+	// to detect local mutations that fingerprint equality alone could not
+	// distinguish (e.g. ClearPolicy followed by a reload of unchanged
+	// storage content).
+	localRevision uint64
 
 	modelPath string
 	model     model.Model
@@ -784,6 +791,12 @@ func (e *Enforcer) getPolicyVersion() uint64 {
 
 func (e *Enforcer) bumpPolicyVersion() {
 	atomic.AddUint64(&e.policyVersion, 1)
+	atomic.AddUint64(&e.localRevision, 1)
+}
+
+// getLocalRevision returns the current in-memory revision counter.
+func (e *Enforcer) getLocalRevision() uint64 {
+	return atomic.LoadUint64(&e.localRevision)
 }
 
 // enforce use a custom matcher to decides whether a "subject" can access a "object" with the operation "action", input parameters are usually: (matcher, sub, obj, act), use model matcher by default when matcher is "".

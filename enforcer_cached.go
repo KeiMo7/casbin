@@ -30,11 +30,10 @@ import (
 // CachedEnforcer wraps Enforcer and provides decision cache.
 type CachedEnforcer struct {
 	*Enforcer
-	cacheVersion uint64
-	expireTime   time.Duration
-	cache        cache.Cache
-	enableCache  int32
-	locker       *sync.RWMutex
+	expireTime  time.Duration
+	cache       cache.Cache
+	enableCache int32
+	locker      *sync.RWMutex
 }
 
 type CacheableParam interface {
@@ -53,7 +52,6 @@ func NewCachedEnforcer(params ...interface{}) (*CachedEnforcer, error) {
 	e.enableCache = 1
 	e.cache, _ = cache.NewDefaultCache()
 	e.locker = new(sync.RWMutex)
-	e.cacheVersion = e.getPolicyVersion()
 	return e, nil
 }
 
@@ -68,6 +66,11 @@ func (e *CachedEnforcer) EnableCache(enableCache bool) {
 
 // Enforce decides whether a "subject" can access a "object" with the operation "action", input parameters are usually: (sub, obj, act).
 // if rvals is not string , ignore the cache.
+//
+// Cache entries are namespaced by the enforcer policy version captured before
+// the underlying decision runs. A policy switch therefore makes every old
+// entry unreachable atomically, and a decision computed against the old policy
+// can never be written back under the new version.
 func (e *CachedEnforcer) Enforce(rvals ...interface{}) (bool, error) {
 	if atomic.LoadInt32(&e.enableCache) == 0 || !e.enabled {
 		return e.Enforcer.Enforce(rvals...)
@@ -79,11 +82,9 @@ func (e *CachedEnforcer) Enforce(rvals ...interface{}) (bool, error) {
 	}
 
 	version := e.getPolicyVersion()
-	if err := e.syncCacheVersion(version); err != nil {
-		return false, err
-	}
+	versionedKey := versionedCacheKey(version, key)
 
-	if res, err := e.getCachedResult(key); err == nil {
+	if res, err := e.getCachedResult(versionedKey); err == nil {
 		return res, nil
 	} else if err != cache.ErrNoSuchKey {
 		return res, err
@@ -94,7 +95,13 @@ func (e *CachedEnforcer) Enforce(rvals ...interface{}) (bool, error) {
 		return false, err
 	}
 
-	err = e.setCachedResult(version, key, res, e.expireTime)
+	// The version is re-checked at write time: if the policy switched while
+	// the decision was being computed, the result belongs to the old version
+	// and is dropped instead of polluting the new namespace.
+	if e.getPolicyVersion() != version {
+		return res, nil
+	}
+	err = e.setCachedResult(versionedKey, res, e.expireTime)
 	return res, err
 }
 
@@ -138,8 +145,6 @@ func (e *CachedEnforcer) RemovePolicies(rules [][]string) (bool, error) {
 }
 
 func (e *CachedEnforcer) getCachedResult(key string) (res bool, err error) {
-	e.locker.Lock()
-	defer e.locker.Unlock()
 	return e.cache.Get(key)
 }
 
@@ -160,6 +165,14 @@ func (e *CachedEnforcer) InvalidateCache() error {
 	e.locker.Lock()
 	defer e.locker.Unlock()
 	return e.cache.Clear()
+}
+
+// versionedCacheKey binds a decision entry to the exact policy version it was
+// computed for. Entries from older versions stay in the cache until expiry or
+// InvalidateCache but become unreachable as soon as the policy version bumps,
+// which makes decision-cache switching atomic with the policy switch.
+func versionedCacheKey(version uint64, key string) string {
+	return strconv.FormatUint(version, 16) + ":" + key
 }
 
 type cacheKeyPart struct {
@@ -217,25 +230,6 @@ func (e *CachedEnforcer) ClearPolicy() {
 	e.Enforcer.ClearPolicy()
 }
 
-// syncCacheVersion drops all cached decisions when the policy has changed since they were cached.
-func (e *CachedEnforcer) syncCacheVersion(version uint64) error {
-	e.locker.Lock()
-	defer e.locker.Unlock()
-	if version <= e.cacheVersion {
-		return nil
-	}
-	if err := e.cache.Clear(); err != nil {
-		return err
-	}
-	e.cacheVersion = version
-	return nil
-}
-
-func (e *CachedEnforcer) setCachedResult(version uint64, key string, res bool, extra ...interface{}) error {
-	e.locker.Lock()
-	defer e.locker.Unlock()
-	if version != e.cacheVersion {
-		return nil
-	}
+func (e *CachedEnforcer) setCachedResult(key string, res bool, extra ...interface{}) error {
 	return e.cache.Set(key, res, extra...)
 }
