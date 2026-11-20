@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/casbin/casbin/v3/constant"
 	"github.com/casbin/casbin/v3/detector"
@@ -66,6 +67,13 @@ type Enforcer struct {
 	autoNotifyDispatcher bool
 	acceptJsonRequest    bool
 	gFunctionCache       bool
+
+	// enforceTimeoutNanos bounds one decision; 0 disables the bound. It is
+	// stored as int64 so SetEnforceTimeout is safe during enforcement.
+	enforceTimeoutNanos int64
+	// patternErrors and timeouts are monotonic counters read by MatchStats.
+	patternErrors uint64
+	timeouts      uint64
 
 	aiConfig AIConfig
 }
@@ -212,6 +220,7 @@ func (e *Enforcer) initialize() {
 	e.autoNotifyWatcher = true
 	e.autoNotifyDispatcher = true
 	e.gFunctionCache = true
+	e.enforceTimeoutNanos = int64(DefaultEnforceTimeout)
 	e.initRmMap()
 
 	// Initialize detectors with default detector if not already set
@@ -787,7 +796,15 @@ func (e *Enforcer) bumpPolicyVersion() {
 }
 
 // enforce use a custom matcher to decides whether a "subject" can access a "object" with the operation "action", input parameters are usually: (matcher, sub, obj, act), use model matcher by default when matcher is "".
-func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interface{}) (ok bool, err error) { //nolint:funlen,cyclop,gocyclo // TODO: reduce function complexity
+func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interface{}) (bool, error) {
+	return e.enforceWithOptions(matcher, explains, nil, rvals...)
+}
+
+// enforceWithOptions is enforce with an optional collector for pattern
+// diagnostics. When diagnostics is non-nil, a rule whose matcher fails with a
+// pattern error is recorded and treated as a non-match; when it is nil the
+// same degradation happens silently and is only counted in MatchStats.
+func (e *Enforcer) enforceWithOptions(matcher string, explains *[]string, diagnostics *[]MatcherDiagnostic, rvals ...interface{}) (ok bool, err error) { //nolint:funlen,cyclop,gocyclo // TODO: reduce function complexity
 	logEntry := e.onLogBeforeEventInEnforce(rvals)
 
 	defer func() {
@@ -904,7 +921,26 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		policyEffects = make([]effector.Effect, policyLen)
 		matcherResults = make([]float64, policyLen)
 
+		var deadline time.Time
+		var timeoutLimit time.Duration
+		if timeoutLimit = e.EnforceTimeout(); timeoutLimit > 0 {
+			deadline = time.Now().Add(timeoutLimit)
+		}
+
 		for policyIndex, pvals := range e.model["p"][pType].Policy {
+			// Check the deadline between rules so a pathological decision
+			// cannot stall the whole batch. Checking every rule would add a
+			// clock read to the hot path; a small stride bounds the overshoot.
+			if !deadline.IsZero() && policyIndex%enforceTimeoutCheckInterval == 0 && time.Now().After(deadline) {
+				// Keep whatever the effector has already accepted in the
+				// explanation, then fail with an explicit timeout conclusion.
+				if explains != nil && explainIndex != -1 && len(e.model["p"][pType].Policy) > explainIndex {
+					*explains = e.model["p"][pType].Policy[explainIndex]
+				}
+				e.recordTimeout()
+				return false, timeoutError(timeoutLimit, policyIndex)
+			}
+
 			// log.LogPrint("Policy Rule: ", pvals)
 			if len(e.model["p"][pType].Tokens) != len(pvals) {
 				return false, fmt.Errorf(
@@ -943,10 +979,22 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 
 			parameters.pVals = pvals
 
-			result, err := expression.Eval(parameters)
+			result, evalErr := expression.Eval(parameters)
 			// log.LogPrint("Result: ", result)
-			if err != nil {
-				return false, err
+			if evalErr != nil {
+				// A malformed pattern in this rule is a configuration error,
+				// not a reason to discard the whole decision. Record it,
+				// count it, and let the rule behave as a non-match so the
+				// remaining rules still decide the result.
+				if diagnostic, isPatternError := matchDiagnostic(pType, policyIndex, pvals, evalErr); isPatternError {
+					e.recordPatternError()
+					if diagnostics != nil {
+						*diagnostics = append(*diagnostics, diagnostic)
+					}
+					result = false
+				} else {
+					return false, evalErr
+				}
 			}
 
 			switch result := result.(type) {

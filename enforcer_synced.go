@@ -232,6 +232,22 @@ func (e *SyncedEnforcer) BatchEnforceWithMatcher(matcher string, requests [][]in
 	return e.Enforcer.BatchEnforceWithMatcher(matcher, requests)
 }
 
+// EnforceWithDiagnostics evaluates a request and reports every rule skipped
+// because of an invalid pattern.
+func (e *SyncedEnforcer) EnforceWithDiagnostics(rvals ...interface{}) (EnforceOutcome, error) {
+	e.m.RLock()
+	defer e.m.RUnlock()
+	return e.Enforcer.EnforceWithDiagnostics(rvals...)
+}
+
+// EnforceWithMatcherAndDiagnostics is EnforceWithDiagnostics with a custom
+// matcher.
+func (e *SyncedEnforcer) EnforceWithMatcherAndDiagnostics(matcher string, rvals ...interface{}) (EnforceOutcome, error) {
+	e.m.RLock()
+	defer e.m.RUnlock()
+	return e.Enforcer.EnforceWithMatcherAndDiagnostics(matcher, rvals...)
+}
+
 // GetAllSubjects gets the list of subjects that show up in the current policy.
 func (e *SyncedEnforcer) GetAllSubjects() ([]string, error) {
 	e.m.RLock()

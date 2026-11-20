@@ -220,11 +220,42 @@ We also provide a [web-based UI](https://casbin.apache.org/docs/admin-portal) fo
 
 ![policy editor](https://hsluoyz.github.io/casbin/ui_policy_editor.png)
 
+## Pattern matching errors
+
+A policy pattern can be malformed, for example `regexMatch(r.act, p.act)` with
+`p.act = "(GET"`. A malformed pattern is treated as a configuration error, not
+as a reason to fail the whole request:
+
+- The rule whose pattern is malformed matches nothing. Other rules are still
+  evaluated, so the decision remains usable.
+- `Enforce` keeps its `(bool, error)` signature. It returns the decision of the
+  remaining rules and counts the skipped rule in `e.MatchStats()`.
+- `EnforceWithDiagnostics` returns the same decision plus a `Diagnostics` slice
+  naming the policy index, matcher, pattern, and cause of each skipped rule.
+  The explanation output of `EnforceEx` is unchanged for valid rules.
+- The govaluate wrappers (`RegexMatchFunc`, `KeyMatch2Func`, ...) still return an
+  error for an invalid pattern; the bool entries (`RegexMatch`, `KeyMatch2`, ...)
+  still answer "no match". Both faces agree on the match result, and the error is
+  a `*util.MatchError` that can be inspected with `errors.As`, `errors.Is(err,
+  util.ErrInvalidPattern)`, and `util.MatchPattern`.
+
+Patterns are validated and compiled once per distinct pattern value and cached
+in a bounded cache (4096 entries per matcher by default, adjustable with
+`util.SetPatternCacheCapacity`). Eviction recompiles a pattern on next use and
+never changes a decision. Every pattern is bounded by `util.MaxPatternLength` and
+`util.MaxPatternSegments`.
+
+In the segment matchers (`keyMatch2/3/4/5`, `keyGet2/3`) a `*` is a wildcard only
+when it occupies a whole path segment. A star with a non-empty suffix inside its
+segment, such as `/foo/*bar`, is rejected instead of being treated as a prefix.
+
+One decision can be bounded with `e.SetEnforceTimeout(d)`. If the bound is
+exceeded, the call returns an error wrapping `casbin.ErrEnforceTimeout`; an
+explanation, when requested, still lists any rule matched before the deadline.
+
 ## Policy persistence
 
-https://casbin.apache.org/docs/adapters
-
-## Policy consistence between multiple nodes
+https://casbin.apache.org/docs/adapters## Policy consistence between multiple nodes
 
 https://casbin.apache.org/docs/watchers
 

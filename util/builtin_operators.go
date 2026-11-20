@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -111,10 +112,10 @@ func tokenGroupName(i int) string {
 	return "casbinToken" + strconv.Itoa(i)
 }
 
-func compilePattern(expr string, tokens []string) *compiledPattern {
+func compilePattern(expr string, tokens []string, matcher string, pattern string) *compiledPattern {
 	re, err := regexp.Compile(expr)
 	if err != nil {
-		return &compiledPattern{tokens: tokens, err: err}
+		return &compiledPattern{tokens: tokens, err: newMatchError(matcher, pattern, MatchErrorSyntax, err)}
 	}
 
 	groups := make([]int, len(tokens))
@@ -136,6 +137,18 @@ func replaceTokens(key2 string, tokenRe *regexp.Regexp, expr string) string {
 	})
 }
 
+// newMatchError builds a *MatchError, stamping the original pattern.
+func newMatchError(matcher string, pattern string, kind MatchErrorKind, cause error) *MatchError {
+	return &MatchError{Matcher: matcher, Pattern: pattern, Kind: kind, Cause: cause}
+}
+
+// tooLongPattern is the MatchError reported when key2 exceeds MaxPatternLength.
+func tooLongPattern(matcher string, pattern string) *MatchError {
+	return newMatchError(matcher, pattern, MatchErrorTooLong,
+		fmt.Errorf("pattern is %d bytes, exceeds the %d byte limit", len(pattern), MaxPatternLength))
+}
+
+// compiledPattern.match returns the stored pattern error, if any.
 func (p *compiledPattern) match(key1 string) (bool, error) {
 	if p.err != nil {
 		return false, p.err
@@ -149,32 +162,152 @@ func (p *compiledPattern) match(key1 string) (bool, error) {
 // ReplaceAll passes just to look it up. Keying on key2 instead makes the steady
 // state a single map read.
 //
-// A policy holds a bounded set of patterns, so the cache converges to that set
-// after the first pass; sync.Map suits that read-mostly shape.
+// The cache is read-mostly, so reads go through sync.Map without a lock. Writes
+// are serialized by mu, which also maintains a bounded FIFO of keys: once the
+// cache holds patternCacheMax entries, inserting a new pattern evicts the oldest
+// one. Eviction only drops a compiled result; the next use of that pattern
+// recompiles it and reaches the same answer, so eviction can never change a
+// decision. The bound matters because key2 can come from an external policy
+// source and would otherwise grow the cache without limit.
 type patternCache struct {
-	m sync.Map // string -> *compiledPattern
+	// m is never copied, so reset clears it with Range+Delete instead of
+	// assigning a fresh sync.Map.
+	m   sync.Map // string -> *compiledPattern
+	mu  sync.Mutex
+	key []string // FIFO ring of cached keys
+	pos int      // next slot to overwrite once full
+	max int
+
+	hits   uint64
+	misses uint64
+}
+
+// patternCacheMax is the default number of distinct patterns held per matcher.
+// It is deliberately generous for real policies and finite for hostile input.
+const patternCacheMax = 4096
+
+func newPatternCache(max int) *patternCache {
+	if max <= 0 {
+		max = patternCacheMax
+	}
+	return &patternCache{max: max}
+}
+
+func (c *patternCache) reset(max int) {
+	if max <= 0 {
+		max = patternCacheMax
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m.Range(func(k interface{}, _ interface{}) bool {
+		c.m.Delete(k)
+		return true
+	})
+	c.key = nil
+	c.pos = 0
+	c.max = max
+	atomic.StoreUint64(&c.hits, 0)
+	atomic.StoreUint64(&c.misses, 0)
 }
 
 func (c *patternCache) get(key2 string, build func(key2 string) *compiledPattern) *compiledPattern {
 	if v, ok := c.m.Load(key2); ok {
+		atomic.AddUint64(&c.hits, 1)
 		return v.(*compiledPattern)
 	}
+	atomic.AddUint64(&c.misses, 1)
 
 	p := build(key2)
-	c.m.Store(key2, p)
+	if actual, loaded := c.m.LoadOrStore(key2, p); loaded {
+		return actual.(*compiledPattern)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.key) < c.max {
+		c.key = append(c.key, key2)
+		return p
+	}
+
+	// Full: overwrite the oldest key in the FIFO ring.
+	evicted := c.key[c.pos]
+	c.key[c.pos] = key2
+	c.pos = (c.pos + 1) % c.max
+	c.m.Delete(evicted)
 
 	return p
 }
 
+// len returns the number of cached patterns.
+func (c *patternCache) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.key)
+}
+
+func (c *patternCache) stats() (hits uint64, misses uint64) {
+	return atomic.LoadUint64(&c.hits), atomic.LoadUint64(&c.misses)
+}
+
 var (
-	keyMatch2Cache patternCache
-	keyMatch3Cache patternCache
-	keyMatch4Cache patternCache
-	keyMatch5Cache patternCache
-	keyGet2Cache   patternCache
-	keyGet3Cache   patternCache
-	regexCache     patternCache
+	keyMatch2Cache = newPatternCache(patternCacheMax)
+	keyMatch3Cache = newPatternCache(patternCacheMax)
+	keyMatch4Cache = newPatternCache(patternCacheMax)
+	keyMatch5Cache = newPatternCache(patternCacheMax)
+	keyGet2Cache   = newPatternCache(patternCacheMax)
+	keyGet3Cache   = newPatternCache(patternCacheMax)
+	regexCache     = newPatternCache(patternCacheMax)
+	globCache      = newPatternCache(patternCacheMax)
 )
+
+// SetPatternCacheCapacity resets every built-in pattern cache and sets the
+// maximum number of distinct patterns each may retain. A non-positive value
+// restores the default. Resetting is safe at any time with respect to the
+// results of matching, but it clears the caches and counters, so call it
+// during setup rather than concurrently with live enforcement.
+func SetPatternCacheCapacity(max int) {
+	for _, c := range []*patternCache{
+		keyMatch2Cache, keyMatch3Cache, keyMatch4Cache, keyMatch5Cache,
+		keyGet2Cache, keyGet3Cache, regexCache, globCache,
+	} {
+		c.reset(max)
+	}
+}
+
+// PatternCacheStats reports hits, misses and the retained size, per matcher.
+// It exists so callers can confirm that a batch of decisions parses each
+// distinct pattern at most once.
+func PatternCacheStats(matcher string) (hits uint64, misses uint64, size int, ok bool) {
+	c := patternCacheFor(matcher)
+	if c == nil {
+		return 0, 0, 0, false
+	}
+	hits, misses = c.stats()
+	return hits, misses, c.len(), true
+}
+
+func patternCacheFor(matcher string) *patternCache {
+	switch matcher {
+	case "keyMatch2":
+		return keyMatch2Cache
+	case "keyMatch3":
+		return keyMatch3Cache
+	case "keyMatch4":
+		return keyMatch4Cache
+	case "keyMatch5":
+		return keyMatch5Cache
+	case "keyGet2":
+		return keyGet2Cache
+	case "keyGet3":
+		return keyGet3Cache
+	case "regexMatch":
+		return regexCache
+	case "globMatch":
+		return globCache
+	default:
+		return nil
+	}
+}
 
 // validate the variadic parameter size and type as string.
 func validateVariadicArgs(expectedLen int, args ...interface{}) error {
@@ -202,16 +335,27 @@ func validateVariadicStringArgs(expectedLen int, args ...string) error {
 
 // KeyMatch determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *.
 // For example, "/foo/bar" matches "/foo/*".
+// A pattern longer than MaxPatternLength matches nothing; KeyMatchFunc reports
+// it as a MatchError.
 func KeyMatch(key1 string, key2 string) bool {
+	matched, _ := keyMatch(key1, key2)
+	return matched
+}
+
+func keyMatch(key1 string, key2 string) (bool, error) {
+	if err := validatePatternBounds("keyMatch", key2); err != nil {
+		return false, err
+	}
+
 	i := strings.Index(key2, "*")
 	if i == -1 {
-		return key1 == key2
+		return key1 == key2, nil
 	}
 
 	if len(key1) > i {
-		return key1[:i] == key2[:i]
+		return key1[:i] == key2[:i], nil
 	}
-	return key1 == key2[:i]
+	return key1 == key2[:i], nil
 }
 
 // KeyMatchFunc is the wrapper for KeyMatch.
@@ -223,23 +367,38 @@ func KeyMatchFunc(args ...interface{}) (interface{}, error) {
 	name1 := args[0].(string)
 	name2 := args[1].(string)
 
-	return KeyMatch(name1, name2), nil
+	matched, err := keyMatch(name1, name2)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", "keyMatch", err)
+	}
+	return matched, nil
 }
 
 // KeyGet returns the matched part
 // For example, "/foo/bar/foo" matches "/foo/*"
 // "bar/foo" will been returned.
+// A pattern longer than MaxPatternLength returns ""; KeyGetFunc reports it as a
+// MatchError.
 func KeyGet(key1, key2 string) string {
+	value, _ := keyGet(key1, key2)
+	return value
+}
+
+func keyGet(key1, key2 string) (string, error) {
+	if err := validatePatternBounds("keyGet", key2); err != nil {
+		return "", err
+	}
+
 	i := strings.Index(key2, "*")
 	if i == -1 {
-		return ""
+		return "", nil
 	}
 	if len(key1) > i {
 		if key1[:i] == key2[:i] {
-			return key1[i:]
+			return key1[i:], nil
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // KeyGetFunc is the wrapper for KeyGet.
@@ -263,19 +422,28 @@ func KeyMatch2(key1 string, key2 string) bool {
 }
 
 func keyMatch2(key1 string, key2 string) (bool, error) {
+	if err := validatePatternBounds("keyMatch2", key2); err != nil {
+		return false, err
+	}
 	if matched, ok := keyMatchShortcut(key1, key2, ":"); ok {
 		return matched, nil
+	}
+
+	if err := validateStarBoundary("keyMatch2", key2); err != nil {
+		return false, err
 	}
 
 	return keyMatch2Cache.get(key2, buildKeyMatch2).match(key1)
 }
 
 func buildKeyMatch2(key2 string) *compiledPattern {
+	original := key2
+
 	key2 = strings.ReplaceAll(key2, "/*", "/.*")
 
 	key2 = keyMatch2Re.ReplaceAllString(key2, "$1[^/]+$2")
 
-	return compilePattern("^"+key2+"$", nil)
+	return compilePattern("^"+key2+"$", nil, "keyMatch2", original)
 }
 
 // KeyMatch2Func is the wrapper for KeyMatch2.
@@ -300,11 +468,18 @@ func KeyMatch2Func(args ...interface{}) (interface{}, error) {
 // if the pathVar == "resource", then "resource1" will be returned.
 // An invalid pattern returns ""; KeyGet2Func reports it as an error.
 func KeyGet2(key1, key2 string, pathVar string) string {
-	value, _ := keyGet(keyGet2Cache.get(key2, buildKeyGet2), key1, pathVar)
+	value, _ := keyGet2(key1, key2, pathVar)
 	return value
 }
 
-func keyGet(p *compiledPattern, key1 string, pathVar string) (string, error) {
+func keyGet2(key1 string, key2 string, pathVar string) (string, error) {
+	if err := validateSegmentPattern("keyGet2", key2); err != nil {
+		return "", err
+	}
+	return extractKey(keyGet2Cache.get(key2, buildKeyGet2), key1, pathVar)
+}
+
+func extractKey(p *compiledPattern, key1 string, pathVar string) (string, error) {
 	if p.err != nil {
 		return "", p.err
 	}
@@ -322,6 +497,8 @@ func keyGet(p *compiledPattern, key1 string, pathVar string) (string, error) {
 }
 
 func buildKeyGet2(key2 string) *compiledPattern {
+	original := key2
+
 	key2 = strings.ReplaceAll(key2, "/*", "/.*")
 
 	// The ":" is dropped here so that the lookup in KeyGet2 is a plain comparison.
@@ -332,7 +509,7 @@ func buildKeyGet2(key2 string) *compiledPattern {
 
 	key2 = replaceTokens(key2, keyGet2Re1, "[^/]+")
 
-	return compilePattern("^"+key2+"$", tokens)
+	return compilePattern("^"+key2+"$", tokens, "keyGet2", original)
 }
 
 // KeyGet2Func is the wrapper for KeyGet2.
@@ -345,7 +522,7 @@ func KeyGet2Func(args ...interface{}) (interface{}, error) {
 	name2 := args[1].(string)
 	key := args[2].(string)
 
-	value, err := keyGet(keyGet2Cache.get(name2, buildKeyGet2), name1, key)
+	value, err := keyGet2(name1, name2, key)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", "keyGet2", err)
 	}
@@ -362,18 +539,27 @@ func KeyMatch3(key1 string, key2 string) bool {
 }
 
 func keyMatch3(key1 string, key2 string) (bool, error) {
+	if err := validatePatternBounds("keyMatch3", key2); err != nil {
+		return false, err
+	}
 	if matched, ok := keyMatchShortcut(key1, key2, ""); ok {
 		return matched, nil
+	}
+
+	if err := validateStarBoundary("keyMatch3", key2); err != nil {
+		return false, err
 	}
 
 	return keyMatch3Cache.get(key2, buildKeyMatch3).match(key1)
 }
 
 func buildKeyMatch3(key2 string) *compiledPattern {
+	original := key2
+
 	key2 = strings.ReplaceAll(key2, "/*", "/.*")
 	key2 = keyMatch3Re.ReplaceAllString(key2, "$1[^/]+$2")
 
-	return compilePattern("^"+key2+"$", nil)
+	return compilePattern("^"+key2+"$", nil, "keyMatch3", original)
 }
 
 // KeyMatch3Func is the wrapper for KeyMatch3.
@@ -398,11 +584,20 @@ func KeyMatch3Func(args ...interface{}) (interface{}, error) {
 // if the pathVar == "project", then "project1" will be returned.
 // An invalid pattern returns ""; KeyGet3Func reports it as an error.
 func KeyGet3(key1, key2 string, pathVar string) string {
-	value, _ := keyGet(keyGet3Cache.get(key2, buildKeyGet3), key1, pathVar)
+	value, _ := keyGet3(key1, key2, pathVar)
 	return value
 }
 
+func keyGet3(key1 string, key2 string, pathVar string) (string, error) {
+	if err := validateSegmentPattern("keyGet3", key2); err != nil {
+		return "", err
+	}
+	return extractKey(keyGet3Cache.get(key2, buildKeyGet3), key1, pathVar)
+}
+
 func buildKeyGet3(key2 string) *compiledPattern {
+	original := key2
+
 	key2 = strings.ReplaceAll(key2, "/*", "/.*")
 
 	// The surrounding "{}" is dropped here so that the lookup in KeyGet3 is a plain
@@ -414,7 +609,7 @@ func buildKeyGet3(key2 string) *compiledPattern {
 
 	key2 = replaceTokens(key2, keyGet3Re1, "[^/]+?")
 
-	return compilePattern("^"+key2+"$", tokens)
+	return compilePattern("^"+key2+"$", tokens, "keyGet3", original)
 }
 
 // KeyGet3Func is the wrapper for KeyGet3.
@@ -427,7 +622,7 @@ func KeyGet3Func(args ...interface{}) (interface{}, error) {
 	name2 := args[1].(string)
 	key := args[2].(string)
 
-	value, err := keyGet(keyGet3Cache.get(name2, buildKeyGet3), name1, key)
+	value, err := keyGet3(name1, name2, key)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", "keyGet3", err)
 	}
@@ -447,8 +642,15 @@ func KeyMatch4(key1 string, key2 string) bool {
 }
 
 func keyMatch4(key1 string, key2 string) (bool, error) {
+	if err := validatePatternBounds("keyMatch4", key2); err != nil {
+		return false, err
+	}
 	if matched, ok := keyMatchShortcut(key1, key2, ""); ok {
 		return matched, nil
+	}
+
+	if err := validateStarBoundary("keyMatch4", key2); err != nil {
+		return false, err
 	}
 
 	p := keyMatch4Cache.get(key2, buildKeyMatch4)
@@ -477,6 +679,8 @@ func keyMatch4(key1 string, key2 string) (bool, error) {
 }
 
 func buildKeyMatch4(key2 string) *compiledPattern {
+	original := key2
+
 	key2 = strings.ReplaceAll(key2, "/*", "/.*")
 
 	tokens := []string{}
@@ -487,7 +691,7 @@ func buildKeyMatch4(key2 string) *compiledPattern {
 		return group
 	})
 
-	return compilePattern("^"+key2+"$", tokens)
+	return compilePattern("^"+key2+"$", tokens, "keyMatch4", original)
 }
 
 // KeyMatch4Func is the wrapper for KeyMatch4.
@@ -519,6 +723,10 @@ func KeyMatch5(key1 string, key2 string) bool {
 }
 
 func keyMatch5(key1 string, key2 string) (bool, error) {
+	if err := validatePatternBounds("keyMatch5", key2); err != nil {
+		return false, err
+	}
+
 	i := strings.Index(key1, "?")
 
 	if i != -1 {
@@ -531,14 +739,20 @@ func keyMatch5(key1 string, key2 string) (bool, error) {
 		return matched, nil
 	}
 
+	if err := validateStarBoundary("keyMatch5", key2); err != nil {
+		return false, err
+	}
+
 	return keyMatch5Cache.get(key2, buildKeyMatch5).match(key1)
 }
 
 func buildKeyMatch5(key2 string) *compiledPattern {
+	original := key2
+
 	key2 = strings.ReplaceAll(key2, "/*", "/.*")
 	key2 = keyMatch5Re.ReplaceAllString(key2, "$1[^/]+$2")
 
-	return compilePattern("^"+key2+"$", nil)
+	return compilePattern("^"+key2+"$", nil, "keyMatch5", original)
 }
 
 // KeyMatch5Func is the wrapper for KeyMatch5.
@@ -561,12 +775,19 @@ func KeyMatch5Func(args ...interface{}) (interface{}, error) {
 // RegexMatch determines whether key1 matches the pattern of key2 in regular expression.
 // An invalid pattern matches nothing; RegexMatchFunc reports it as an error.
 func RegexMatch(key1 string, key2 string) bool {
-	matched, _ := regexCache.get(key2, buildRegexMatch).match(key1)
+	matched, _ := regexMatch(key1, key2)
 	return matched
 }
 
+func regexMatch(key1 string, key2 string) (bool, error) {
+	if err := validatePatternBounds("regexMatch", key2); err != nil {
+		return false, err
+	}
+	return regexCache.get(key2, buildRegexMatch).match(key1)
+}
+
 func buildRegexMatch(key2 string) *compiledPattern {
-	return compilePattern(key2, nil)
+	return compilePattern(key2, nil, "regexMatch", key2)
 }
 
 // RegexMatchFunc is the wrapper for RegexMatch.
@@ -578,7 +799,7 @@ func RegexMatchFunc(args ...interface{}) (interface{}, error) {
 	name1 := args[0].(string)
 	name2 := args[1].(string)
 
-	matched, err := regexCache.get(name2, buildRegexMatch).match(name1)
+	matched, err := regexMatch(name1, name2)
 	if err != nil {
 		return false, fmt.Errorf("%s: %w", "regexMatch", err)
 	}
@@ -631,8 +852,30 @@ func IPMatchFunc(args ...interface{}) (interface{}, error) {
 }
 
 // GlobMatch determines whether key1 matches the pattern of key2 using glob pattern.
+// An invalid pattern matches nothing; the returned error is a *MatchError.
 func GlobMatch(key1 string, key2 string) (bool, error) {
+	return globMatch(key1, key2)
+}
+
+func globMatch(key1 string, key2 string) (bool, error) {
+	if err := validatePatternBounds("globMatch", key2); err != nil {
+		return false, err
+	}
+
+	if p := globCache.get(key2, buildGlobMatch); p.err != nil {
+		return false, p.err
+	}
+
 	return doublestar.Match(key2, key1)
+}
+
+// buildGlobMatch validates the pattern once; the validated pattern still goes
+// through doublestar.Match, which does its own matching work per call.
+func buildGlobMatch(key2 string) *compiledPattern {
+	if !doublestar.ValidatePattern(key2) {
+		return &compiledPattern{err: newMatchError("globMatch", key2, MatchErrorSyntax, doublestar.ErrBadPattern)}
+	}
+	return &compiledPattern{}
 }
 
 // GlobMatchFunc is the wrapper for GlobMatch.

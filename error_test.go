@@ -297,11 +297,40 @@ func TestInvalidPatternInPolicy(t *testing.T) {
 	if _, err = e.AddPolicy("alice", "/alice_data/*", "(GET"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = e.AddPolicy("alice", "/alice_data/*", "GET"); err != nil {
+		t.Fatal(err)
+	}
 
-	_, err = e.Enforce("alice", "/alice_data/resource1", "GET")
-	if err == nil || strings.HasPrefix(err.Error(), "panic:") ||
-		!strings.Contains(err.Error(), "regexMatch: error parsing regexp: missing closing ): `(GET`") {
-		t.Errorf("Enforce returns %v, supposed to be a regexMatch parse error", err)
+	// A rule with an invalid regexp is a configuration error, not a reason to
+	// discard the decision: that rule matches nothing and the policy's other
+	// rules still decide. EnforceWithDiagnostics reports which rule is bad.
+	outcome, err := e.EnforceWithDiagnostics("alice", "/alice_data/resource1", "GET")
+	if err != nil {
+		t.Fatalf("EnforceWithDiagnostics returns %v, supposed to degrade the bad rule", err)
+	}
+	if !outcome.Allowed {
+		t.Error("the valid rule should still grant access")
+	}
+	if len(outcome.Diagnostics) != 1 {
+		t.Fatalf("expected 1 diagnostic, got %d: %+v", len(outcome.Diagnostics), outcome.Diagnostics)
+	}
+	diagnostic := outcome.Diagnostics[0]
+	if diagnostic.Matcher != "regexMatch" || diagnostic.Pattern != "(GET" ||
+		diagnostic.Kind != util.MatchErrorSyntax || diagnostic.PolicyIndex < 0 {
+		t.Errorf("unexpected diagnostic: %+v", diagnostic)
+	}
+
+	// The plain Enforce entry degrades the same rule and reports the same
+	// usable decision, without surfacing an error.
+	allowed, err := e.Enforce("alice", "/alice_data/resource1", "GET")
+	if err != nil {
+		t.Fatalf("Enforce returns %v, supposed to degrade the bad rule", err)
+	}
+	if !allowed {
+		t.Error("Enforce should return the decision of the valid rules")
+	}
+	if stats := e.MatchStats(); stats.PatternErrors == 0 {
+		t.Error("the skipped rule should be counted in MatchStats")
 	}
 
 	e, err = NewEnforcer("examples/rbac_with_pattern_model.conf", "examples/rbac_with_pattern_policy.csv")
