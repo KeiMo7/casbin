@@ -25,6 +25,7 @@ import (
 	Err "github.com/casbin/casbin/v3/errors"
 	"github.com/casbin/casbin/v3/model"
 	"github.com/casbin/casbin/v3/persist"
+	"github.com/casbin/casbin/v3/persist/policyhistory"
 )
 
 // ContextEnforcer wraps Enforcer and provides context-aware operations.
@@ -415,7 +416,10 @@ func (e *ContextEnforcer) SelfUpdatePoliciesCtx(ctx context.Context, sec string,
 // Internal API methods with context support
 
 // addPolicyWithoutNotifyCtx adds a rule to the current policy with context.
-func (e *ContextEnforcer) addPolicyWithoutNotifyCtx(ctx context.Context, sec string, ptype string, rule []string) (bool, error) {
+func (e *ContextEnforcer) addPolicyWithoutNotifyCtx(ctx context.Context, sec string, ptype string, rule []string) (ok bool, err error) {
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "add policy", nil, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if e.dispatcher != nil && e.autoNotifyDispatcher {
@@ -451,7 +455,10 @@ func (e *ContextEnforcer) addPolicyWithoutNotifyCtx(ctx context.Context, sec str
 }
 
 // addPoliciesWithoutNotifyCtx adds rules to the current policy with context.
-func (e *ContextEnforcer) addPoliciesWithoutNotifyCtx(ctx context.Context, sec string, ptype string, rules [][]string, autoRemoveRepeat bool) (bool, error) {
+func (e *ContextEnforcer) addPoliciesWithoutNotifyCtx(ctx context.Context, sec string, ptype string, rules [][]string, autoRemoveRepeat bool) (ok bool, err error) {
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "add policies", nil, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if e.dispatcher != nil && e.autoNotifyDispatcher {
@@ -473,7 +480,7 @@ func (e *ContextEnforcer) addPoliciesWithoutNotifyCtx(ctx context.Context, sec s
 		}
 	}
 
-	err := e.model.AddPolicies(sec, ptype, rules)
+	err = e.model.AddPolicies(sec, ptype, rules)
 	if err != nil {
 		return false, err
 	}
@@ -494,7 +501,10 @@ func (e *ContextEnforcer) addPoliciesWithoutNotifyCtx(ctx context.Context, sec s
 }
 
 // removePolicyWithoutNotifyCtx removes a rule from the current policy with context.
-func (e *ContextEnforcer) removePolicyWithoutNotifyCtx(ctx context.Context, sec string, ptype string, rule []string) (bool, error) {
+func (e *ContextEnforcer) removePolicyWithoutNotifyCtx(ctx context.Context, sec string, ptype string, rule []string) (ok bool, err error) {
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "remove policy", nil, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if e.dispatcher != nil && e.autoNotifyDispatcher {
@@ -525,7 +535,10 @@ func (e *ContextEnforcer) removePolicyWithoutNotifyCtx(ctx context.Context, sec 
 }
 
 // removePoliciesWithoutNotifyCtx removes rules from the current policy with context.
-func (e *ContextEnforcer) removePoliciesWithoutNotifyCtx(ctx context.Context, sec string, ptype string, rules [][]string) (bool, error) {
+func (e *ContextEnforcer) removePoliciesWithoutNotifyCtx(ctx context.Context, sec string, ptype string, rules [][]string) (ok bool, err error) {
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "remove policies", nil, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if hasPolicies, err := e.model.HasPolicies(sec, ptype, rules); !hasPolicies || err != nil {
@@ -559,7 +572,10 @@ func (e *ContextEnforcer) removePoliciesWithoutNotifyCtx(ctx context.Context, se
 }
 
 // removeFilteredPolicyWithoutNotifyCtx removes policy rules that match the filter from the current policy with context.
-func (e *ContextEnforcer) removeFilteredPolicyWithoutNotifyCtx(ctx context.Context, sec string, ptype string, fieldIndex int, fieldValues []string) (bool, error) {
+func (e *ContextEnforcer) removeFilteredPolicyWithoutNotifyCtx(ctx context.Context, sec string, ptype string, fieldIndex int, fieldValues []string) (ok bool, err error) {
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "remove filtered policy", nil, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if len(fieldValues) == 0 {
@@ -594,7 +610,11 @@ func (e *ContextEnforcer) removeFilteredPolicyWithoutNotifyCtx(ctx context.Conte
 }
 
 // updatePolicyWithoutNotifyCtx updates a policy rule in the current policy with context.
-func (e *ContextEnforcer) updatePolicyWithoutNotifyCtx(ctx context.Context, sec string, ptype string, oldRule, newRule []string) (bool, error) {
+func (e *ContextEnforcer) updatePolicyWithoutNotifyCtx(ctx context.Context, sec string, ptype string, oldRule, newRule []string) (ok bool, err error) {
+	pairs := []policyhistory.UpdatePair{{Section: sec, PType: ptype, OldRule: oldRule, NewRule: newRule}}
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "update policy", &pairs, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if e.dispatcher != nil && e.autoNotifyDispatcher {
@@ -627,7 +647,17 @@ func (e *ContextEnforcer) updatePolicyWithoutNotifyCtx(ctx context.Context, sec 
 	return ruleUpdated, nil
 }
 
-func (e *ContextEnforcer) updatePoliciesWithoutNotifyCtx(ctx context.Context, sec string, ptype string, oldRules [][]string, newRules [][]string) (bool, error) {
+func (e *ContextEnforcer) updatePoliciesWithoutNotifyCtx(ctx context.Context, sec string, ptype string, oldRules [][]string, newRules [][]string) (ok bool, err error) {
+	pairs := make([]policyhistory.UpdatePair, 0, len(oldRules))
+	for i := range oldRules {
+		if i >= len(newRules) {
+			break
+		}
+		pairs = append(pairs, policyhistory.UpdatePair{Section: sec, PType: ptype, OldRule: oldRules[i], NewRule: newRules[i]})
+	}
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "update policies", &pairs, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if len(newRules) != len(oldRules) {
@@ -819,13 +849,13 @@ func (e *ContextEnforcer) updateFilteredPoliciesCtx(ctx context.Context, sec str
 	return true, nil
 }
 
-func (e *ContextEnforcer) updateFilteredPoliciesWithoutNotifyCtx(ctx context.Context, sec string, ptype string, newRules [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
-	defer e.bumpPolicyVersion()
+func (e *ContextEnforcer) updateFilteredPoliciesWithoutNotifyCtx(ctx context.Context, sec string, ptype string, newRules [][]string, fieldIndex int, fieldValues ...string) (oldRules [][]string, err error) {
+	session := e.beginHistory()
+	defer func() {
+		e.finishHistory(session, policyhistory.KindChange, "update filtered policies", nil, nil, &err)
+	}()
 
-	var (
-		oldRules [][]string
-		err      error
-	)
+	defer e.bumpPolicyVersion()
 
 	if _, err = e.model.GetAssertion(sec, ptype); err != nil {
 		return oldRules, err

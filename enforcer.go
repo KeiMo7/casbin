@@ -68,6 +68,13 @@ type Enforcer struct {
 	gFunctionCache       bool
 
 	aiConfig AIConfig
+
+	// Policy history is a side channel: enforcement never reads these fields.
+	// historyMutex protects the pointer and the actor; PolicyHistory.mutex
+	// serializes mutations with their version records.
+	history      *PolicyHistory
+	historyMutex sync.RWMutex
+	historyActor string
 }
 
 // EnforceContext is used as the first element of the parameter "rvals" in method "enforce".
@@ -370,6 +377,7 @@ func (e *Enforcer) RunDetections() error {
 
 // ClearPolicy clears all policy.
 func (e *Enforcer) ClearPolicy() {
+	previousSnapshot := modelPolicySnapshot(e.historyCopyModelOrCurrent())
 	e.invalidateMatcherMap()
 
 	if e.dispatcher != nil && e.autoNotifyDispatcher {
@@ -380,6 +388,17 @@ func (e *Enforcer) ClearPolicy() {
 	if e.autoBuildRoleLinks {
 		e.clearRoleLinks()
 	}
+	_ = e.recordClearPolicy(previousSnapshot)
+}
+
+// historyCopyModelOrCurrent returns a copy of the model when history is
+// enabled, and the current model otherwise. Callers compare against it after
+// the mutation, so returning the live model is fine when nothing is recorded.
+func (e *Enforcer) historyCopyModelOrCurrent() model.Model {
+	if copied := e.historyCopyModel(); copied != nil {
+		return copied
+	}
+	return e.model
 }
 
 func (e *Enforcer) clearRoleLinks() {
@@ -395,6 +414,9 @@ func (e *Enforcer) clearRoleLinks() {
 func (e *Enforcer) LoadPolicy() error {
 	logEntry := e.onLogBeforeEventInLoadPolicy()
 
+	previousModel := e.historyCopyModel()
+	previousSnapshot := modelPolicySnapshot(previousModel)
+
 	newModel, err := e.loadPolicyFromAdapter(e.model)
 	if err != nil {
 		e.onLogAfterEventWithError(logEntry, err)
@@ -402,6 +424,20 @@ func (e *Enforcer) LoadPolicy() error {
 	}
 	err = e.applyModifiedModel(newModel)
 	if err != nil {
+		e.onLogAfterEventWithError(logEntry, err)
+		return err
+	}
+
+	if err := e.recordPolicyReload(previousSnapshot); err != nil {
+		// The policy was already replaced; put the previous one back so that a
+		// loaded policy can never exist without its version record.
+		e.model = previousModel
+		e.resetPolicyCaches()
+		if e.autoBuildRoleLinks {
+			_ = e.rebuildRoleLinks(e.model)
+			_ = e.rebuildConditionalRoleLinks(e.model)
+		}
+		e.invalidateMatcherMap()
 		e.onLogAfterEventWithError(logEntry, err)
 		return err
 	}
@@ -415,6 +451,19 @@ func (e *Enforcer) LoadPolicy() error {
 	}
 
 	return nil
+}
+
+// historyCopyModel returns a copy of the current model when history is enabled
+// so the policy can be restored if recording fails. It returns nil otherwise,
+// keeping the reload path allocation free when history is off.
+func (e *Enforcer) historyCopyModel() model.Model {
+	e.historyMutex.RLock()
+	enabled := e.history != nil
+	e.historyMutex.RUnlock()
+	if !enabled {
+		return nil
+	}
+	return e.model.Copy()
 }
 
 func (e *Enforcer) loadPolicyFromAdapter(baseModel model.Model) (model.Model, error) {
@@ -537,14 +586,23 @@ func (e *Enforcer) loadFilteredPolicy(filter interface{}) error {
 
 // LoadFilteredPolicy reloads a filtered policy from file/database.
 func (e *Enforcer) LoadFilteredPolicy(filter interface{}) error {
+	previousSnapshot := modelPolicySnapshot(e.historyCopyModelOrCurrent())
 	e.model.ClearPolicy()
 
-	return e.loadFilteredPolicy(filter)
+	if err := e.loadFilteredPolicy(filter); err != nil {
+		return err
+	}
+	return e.recordPolicyReload(previousSnapshot)
 }
 
 // LoadIncrementalFilteredPolicy append a filtered policy from file/database.
 func (e *Enforcer) LoadIncrementalFilteredPolicy(filter interface{}) error {
-	return e.loadFilteredPolicy(filter)
+	previousSnapshot := modelPolicySnapshot(e.historyCopyModelOrCurrent())
+
+	if err := e.loadFilteredPolicy(filter); err != nil {
+		return err
+	}
+	return e.recordPolicyReload(previousSnapshot)
 }
 
 // IsFiltered returns true if the loaded policy has been filtered.

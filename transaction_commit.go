@@ -19,9 +19,11 @@ package casbin
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 
 	"github.com/casbin/casbin/v3/persist"
+	"github.com/casbin/casbin/v3/persist/policyhistory"
 )
 
 // Commit commits the transaction using a two-phase commit protocol.
@@ -86,12 +88,31 @@ func (tx *Transaction) Commit() error {
 		return err
 	}
 
+	// Record the committed policy change as one history version before it is
+	// announced, so the history and the database never diverge. The snapshot is
+	// only taken when history is enabled.
+	var previousSnapshot policyhistory.Snapshot
+	if previousModel := tx.enforcer.historyCopyModel(); previousModel != nil {
+		previousSnapshot = modelPolicySnapshot(previousModel)
+	}
+
 	// Phase 2: Apply changes to the in-memory model
 	if err := tx.applyOperationsToModel(); err != nil {
 		// At this point, database is committed but model update failed.
 		// This is a critical error that should not happen in normal circumstances.
 		tx.enforcer.activeTransactions.Delete(tx.id)
 		return errors.New("critical error: database committed but model update failed: " + err.Error())
+	}
+
+	if previousSnapshot != nil {
+		if err := tx.enforcer.recordPolicyReload(previousSnapshot); err != nil {
+			// The database is already committed at this point, so the in-memory
+			// model is kept in sync with it and the failure is reported: a
+			// subsequent reload can re-record the change.
+			atomic.AddInt64(&tx.enforcer.modelVersion, 1)
+			tx.enforcer.activeTransactions.Delete(tx.id)
+			return fmt.Errorf("transaction committed but policy history could not record it: %w", err)
+		}
 	}
 
 	// Increment model version number.

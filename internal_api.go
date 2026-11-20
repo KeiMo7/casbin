@@ -24,6 +24,7 @@ import (
 	"github.com/casbin/casbin/v3/log"
 	"github.com/casbin/casbin/v3/model"
 	"github.com/casbin/casbin/v3/persist"
+	"github.com/casbin/casbin/v3/persist/policyhistory"
 )
 
 const (
@@ -45,7 +46,10 @@ func (e *Enforcer) validateConstraintsForGroupingPolicy() error {
 }
 
 // addPolicy adds a rule to the current policy.
-func (e *Enforcer) addPolicyWithoutNotify(sec string, ptype string, rule []string) (bool, error) {
+func (e *Enforcer) addPolicyWithoutNotify(sec string, ptype string, rule []string) (ok bool, err error) {
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "add policy", nil, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if e.dispatcher != nil && e.autoNotifyDispatcher {
@@ -88,7 +92,10 @@ func (e *Enforcer) addPolicyWithoutNotify(sec string, ptype string, rule []strin
 // addPoliciesWithoutNotify adds rules to the current policy without notify
 // If autoRemoveRepeat == true, existing rules are automatically filtered
 // Otherwise, false is returned directly.
-func (e *Enforcer) addPoliciesWithoutNotify(sec string, ptype string, rules [][]string, autoRemoveRepeat bool) (bool, error) {
+func (e *Enforcer) addPoliciesWithoutNotify(sec string, ptype string, rules [][]string, autoRemoveRepeat bool) (ok bool, err error) {
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "add policies", nil, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if e.dispatcher != nil && e.autoNotifyDispatcher {
@@ -110,7 +117,7 @@ func (e *Enforcer) addPoliciesWithoutNotify(sec string, ptype string, rules [][]
 		}
 	}
 
-	err := e.model.AddPolicies(sec, ptype, rules)
+	err = e.model.AddPolicies(sec, ptype, rules)
 	if err != nil {
 		return false, err
 	}
@@ -136,7 +143,10 @@ func (e *Enforcer) addPoliciesWithoutNotify(sec string, ptype string, rules [][]
 }
 
 // removePolicy removes a rule from the current policy.
-func (e *Enforcer) removePolicyWithoutNotify(sec string, ptype string, rule []string) (bool, error) {
+func (e *Enforcer) removePolicyWithoutNotify(sec string, ptype string, rule []string) (ok bool, err error) {
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "remove policy", nil, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if e.dispatcher != nil && e.autoNotifyDispatcher {
@@ -171,7 +181,11 @@ func (e *Enforcer) removePolicyWithoutNotify(sec string, ptype string, rule []st
 	return ruleRemoved, nil
 }
 
-func (e *Enforcer) updatePolicyWithoutNotify(sec string, ptype string, oldRule []string, newRule []string) (bool, error) {
+func (e *Enforcer) updatePolicyWithoutNotify(sec string, ptype string, oldRule []string, newRule []string) (ok bool, err error) {
+	pairs := []policyhistory.UpdatePair{{Section: sec, PType: ptype, OldRule: oldRule, NewRule: newRule}}
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "update policy", &pairs, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if e.dispatcher != nil && e.autoNotifyDispatcher {
@@ -209,7 +223,17 @@ func (e *Enforcer) updatePolicyWithoutNotify(sec string, ptype string, oldRule [
 	return ruleUpdated, nil
 }
 
-func (e *Enforcer) updatePoliciesWithoutNotify(sec string, ptype string, oldRules [][]string, newRules [][]string) (bool, error) {
+func (e *Enforcer) updatePoliciesWithoutNotify(sec string, ptype string, oldRules [][]string, newRules [][]string) (ok bool, err error) {
+	pairs := make([]policyhistory.UpdatePair, 0, len(oldRules))
+	for i := range oldRules {
+		if i >= len(newRules) {
+			break
+		}
+		pairs = append(pairs, policyhistory.UpdatePair{Section: sec, PType: ptype, OldRule: oldRules[i], NewRule: newRules[i]})
+	}
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "update policies", &pairs, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if len(newRules) != len(oldRules) {
@@ -253,7 +277,10 @@ func (e *Enforcer) updatePoliciesWithoutNotify(sec string, ptype string, oldRule
 }
 
 // removePolicies removes rules from the current policy.
-func (e *Enforcer) removePoliciesWithoutNotify(sec string, ptype string, rules [][]string) (bool, error) {
+func (e *Enforcer) removePoliciesWithoutNotify(sec string, ptype string, rules [][]string) (ok bool, err error) {
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "remove policies", nil, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if hasPolicies, err := e.model.HasPolicies(sec, ptype, rules); !hasPolicies || err != nil {
@@ -292,7 +319,10 @@ func (e *Enforcer) removePoliciesWithoutNotify(sec string, ptype string, rules [
 }
 
 // removeFilteredPolicy removes rules based on field filters from the current policy.
-func (e *Enforcer) removeFilteredPolicyWithoutNotify(sec string, ptype string, fieldIndex int, fieldValues []string) (bool, error) {
+func (e *Enforcer) removeFilteredPolicyWithoutNotify(sec string, ptype string, fieldIndex int, fieldValues []string) (ok bool, err error) {
+	session := e.beginHistory()
+	defer e.finishHistory(session, policyhistory.KindChange, "remove filtered policy", nil, &ok, &err)
+
 	defer e.bumpPolicyVersion()
 
 	if len(fieldValues) == 0 {
@@ -331,13 +361,16 @@ func (e *Enforcer) removeFilteredPolicyWithoutNotify(sec string, ptype string, f
 	return ruleRemoved, nil
 }
 
-func (e *Enforcer) updateFilteredPoliciesWithoutNotify(sec string, ptype string, newRules [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
-	defer e.bumpPolicyVersion()
+func (e *Enforcer) updateFilteredPoliciesWithoutNotify(sec string, ptype string, newRules [][]string, fieldIndex int, fieldValues ...string) (oldRules [][]string, err error) {
+	session := e.beginHistory()
+	defer func() {
+		// A filtered update can change the policy while returning no old rules
+		// (for example when the adapter performed the change), so change
+		// detection is left to the snapshot diff instead of the ok flag.
+		e.finishHistory(session, policyhistory.KindChange, "update filtered policies", nil, nil, &err)
+	}()
 
-	var (
-		oldRules [][]string
-		err      error
-	)
+	defer e.bumpPolicyVersion()
 
 	if _, err = e.model.GetAssertion(sec, ptype); err != nil {
 		return oldRules, err
