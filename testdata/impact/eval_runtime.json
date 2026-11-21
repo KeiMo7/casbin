@@ -1,0 +1,22 @@
+{
+  "name": "eval-runtime",
+  "model": "eval_model.conf",
+  "current": [
+    "p, true, data1, read"
+  ],
+  "candidate": [
+    "p, true, data1, read",
+    "p, r.sub.Age > 18, data2, read"
+  ],
+  "expect": {
+    "flips": [],
+    "flip_count": 0,
+    "uncertain": [
+      {
+        "kind": "runtime-rule",
+        "request": ["alice", "data2", "read"],
+        "dependency_contains": "Age"
+      }
+    ]
+  }
+}

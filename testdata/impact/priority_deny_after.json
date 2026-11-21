@@ -1,0 +1,17 @@
+{
+  "name": "priority-deny-after",
+  "model": "priority_model.conf",
+  "current": [
+    "p, team, data1, read, allow",
+    "g, alice, team"
+  ],
+  "candidate": [
+    "p, team, data1, read, allow",
+    "p, alice, data1, read, deny",
+    "g, alice, team"
+  ],
+  "expect": {
+    "flips": [],
+    "flip_count": 0
+  }
+}

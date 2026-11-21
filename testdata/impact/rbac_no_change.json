@@ -1,0 +1,17 @@
+{
+  "name": "rbac-no-change",
+  "model": "rbac_model.conf",
+  "current": [
+    "p, role:reader, data1, read",
+    "g, alice, role:reader"
+  ],
+  "candidate": [
+    "p, role:reader, data1, read",
+    "g, alice, role:reader"
+  ],
+  "expect": {
+    "flips": [],
+    "flip_count": 0,
+    "diff_empty": true
+  }
+}

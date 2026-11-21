@@ -1,0 +1,50 @@
+{
+  "name": "truncation",
+  "model": "rbac_model.conf",
+  "current": [
+    "p, role:reader, data1, read"
+  ],
+  "candidate": [
+    "p, role:reader, data1, read",
+    "p, user0, data1, read",
+    "p, user1, data1, read",
+    "p, user2, data1, read",
+    "p, user3, data1, read",
+    "p, user4, data1, read",
+    "p, user5, data1, read",
+    "p, user6, data1, read",
+    "p, user7, data1, read"
+  ],
+  "options": {
+    "witness_limit": 4
+  },
+  "expect": {
+    "flips": [
+      {
+        "request": [
+          "user0",
+          "data1",
+          "read"
+        ],
+        "direction": "deny->allow",
+        "causes": [
+          {
+            "section": "p",
+            "ptype": "p",
+            "rule": [
+              "user0",
+              "data1",
+              "read"
+            ]
+          }
+        ]
+      }
+    ],
+    "flip_count": 4,
+    "truncation": {
+      "limit": 4,
+      "dropped": 5,
+      "at_least_omitted_groups": 1
+    }
+  }
+}

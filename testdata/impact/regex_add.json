@@ -1,0 +1,21 @@
+{
+  "name": "regex-add",
+  "model": "regex_model.conf",
+  "current": [
+    "p, alice, /data/1, GET"
+  ],
+  "candidate": [
+    "p, alice, /data/1, GET",
+    "p, alice, /data/[0-9]+, POST"
+  ],
+  "expect": {
+    "flips": [
+      {
+        "request": ["alice", "/data/0", "POST"],
+        "direction": "deny->allow",
+        "causes": [{"section": "p", "ptype": "p", "rule": ["alice", "/data/[0-9]+", "POST"]}]
+      }
+    ],
+    "flip_count": 1
+  }
+}

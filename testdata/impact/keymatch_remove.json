@@ -1,0 +1,21 @@
+{
+  "name": "keymatch-remove",
+  "model": "key_model.conf",
+  "current": [
+    "p, alice, /data/1, GET",
+    "p, alice, /data/*, (GET|POST)"
+  ],
+  "candidate": [
+    "p, alice, /data/1, GET"
+  ],
+  "expect": {
+    "flips": [
+      {
+        "request": ["alice", "/data/x", "GET"],
+        "direction": "allow->deny",
+        "causes": [{"section": "p", "ptype": "p", "rule": ["alice", "/data/*", "(GET|POST)"]}]
+      }
+    ],
+    "flip_count": 2
+  }
+}

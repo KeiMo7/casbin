@@ -59,6 +59,7 @@ Apache Casbin is a powerful and efficient open-source access control library for
 - [Tutorials](#tutorials)
 - [Get started](#get-started)
 - [Policy management](#policy-management)
+- [Policy change impact preview](#policy-change-impact-preview)
 - [Policy persistence](#policy-persistence)
 - [Policy consistence between multiple nodes](#policy-consistence-between-multiple-nodes)
 - [Enforcer pooling](#enforcer-pooling)
@@ -219,6 +220,68 @@ We also provide a [web-based UI](https://casbin.apache.org/docs/admin-portal) fo
 ![model editor](https://hsluoyz.github.io/casbin/ui_model_editor.png)
 
 ![policy editor](https://hsluoyz.github.io/casbin/ui_policy_editor.png)
+
+## Policy change impact preview
+
+A policy edit is easy to write and hard to review: a single inherited role link
+or a wildcard rule can change decisions for people nobody thought about. `Impact`
+answers the reviewer's question directly — *whose access changes, and which
+rule caused it?* — without enumerating the request space and without touching
+the live policy:
+
+```go
+candidate := casbin.ImpactSnapshot{
+    Model: e.GetModel(),
+    Policy: []casbin.ImpactRule{
+        {PType: "p", Rule: []string{"role:reader", "data1", "read"}},
+        {PType: "g", Rule: []string{"alice", "role:reader", "domain1"}},
+        {PType: "p", Rule: []string{"alice", "reports", "read"}},
+    },
+}
+
+report, err := e.Impact(candidate, casbin.ImpactOptions{})
+if err != nil {
+    return err
+}
+if report.Failure != nil {
+    // The preview refused to conclude; report.Failure names the rule.
+    return fmt.Errorf("preview failed: %s", report.Failure)
+}
+if err := report.Verify(); err != nil {
+    // Counters do not reconcile: the report is untrustworthy.
+    return err
+}
+for _, f := range report.Flips {
+    log.Printf("%s: %s (%s)", f.RequestString, f.Direction, f.Explanation)
+}
+```
+
+What the report guarantees:
+
+- **Bounded, explainable work.** Witness requests are derived from the policy
+  entities (changed rules, their concrete pattern instances, and the role
+  closure each change can reach), not from the Cartesian product of the request
+  space. When the witness set exceeds `WitnessLimit` the tail is dropped in a
+  documented order and the report records a `Truncation` naming what was not
+  examined.
+- **Minimal causes.** Each flip cites an irreducible subset of the added and
+  removed rules: dropping any one of the cited rules makes the flip disappear.
+- **Uncertainty, separated.** Rules that read request attributes (`eval(...)`),
+  host matcher functions, and conditional role links cannot be decided
+  statically. Their witnesses are counted as `Uncertain`, never as allow or deny.
+- **Reconciliation.** `AllowToDeny + DenyToAllow + Uncertain + Unchanged` equals
+  the number of examined witnesses, and the detail lists match the counters;
+  `Report.Verify()` fails otherwise.
+- **Determinism.** The same pair of policies produces the same report, including
+  ordering, on every run.
+- **No side effects.** Both sides are evaluated through throwaway enforcers built
+  from copies. The live enforcer's policy, role links and matcher caches are
+  untouched; if the live policy changes during the run, `Impact` returns an
+  error instead of a stale report.
+
+Role managers with name-matching functions (`AddNamedMatchingFunc`) carry
+enforcer state that a model snapshot cannot reproduce; the preview reports a
+`Failure` instead of computing role closure from literal names.
 
 ## Policy persistence
 

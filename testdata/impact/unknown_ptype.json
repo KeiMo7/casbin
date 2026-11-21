@@ -1,0 +1,17 @@
+{
+  "name": "unknown-ptype",
+  "model": "rbac_model.conf",
+  "current": [
+    "p, alice, data1, read"
+  ],
+  "candidate": [
+    "p, alice, data1, read",
+    "p2, alice, data2, read"
+  ],
+  "expect": {
+    "failure": {
+      "stage": "rule",
+      "rule": ["alice", "data2", "read"]
+    }
+  }
+}

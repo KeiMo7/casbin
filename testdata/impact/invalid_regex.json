@@ -1,0 +1,17 @@
+{
+  "name": "invalid-regex",
+  "model": "regex_model.conf",
+  "current": [
+    "p, alice, /data/1, GET"
+  ],
+  "candidate": [
+    "p, alice, /data/1, GET",
+    "p, alice, /data/[0-9+, GET"
+  ],
+  "expect": {
+    "failure": {
+      "stage": "rule",
+      "rule": ["alice", "/data/[0-9+", "GET"]
+    }
+  }
+}

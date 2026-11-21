@@ -1,0 +1,30 @@
+{
+  "name": "rbac-deep-closure",
+  "model": "rbac_model.conf",
+  "current": [
+    "p, role:top, data1, read",
+    "g, mid, role:top",
+    "g, role:low, mid",
+    "g, alice, role:low"
+  ],
+  "candidate": [
+    "p, role:top, data1, read",
+    "g, mid, role:top",
+    "g, alice, role:low"
+  ],
+  "expect": {
+    "flips": [
+      {
+        "request": ["alice", "data1", "read"],
+        "direction": "allow->deny",
+        "causes": [{"section": "g", "ptype": "g", "rule": ["role:low", "mid"]}]
+      },
+      {
+        "request": ["role:low", "data1", "read"],
+        "direction": "allow->deny",
+        "causes": [{"section": "g", "ptype": "g", "rule": ["role:low", "mid"]}]
+      }
+    ],
+    "flip_count": 2
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "resource-role-add",
+  "model": "resource_role_model.conf",
+  "current": [
+    "p, book_admin, book_group, GET",
+    "g, alice, book_admin",
+    "g2, /book/1, book_group"
+  ],
+  "candidate": [
+    "p, book_admin, book_group, GET",
+    "g, alice, book_admin",
+    "g2, /book/1, book_group",
+    "g2, /book/2, book_group"
+  ],
+  "expect": {
+    "flips": [
+      {
+        "request": ["alice", "/book/2", "GET"],
+        "direction": "deny->allow",
+        "causes": [{"section": "g", "ptype": "g2", "rule": ["/book/2", "book_group"]}]
+      }
+    ],
+    "flip_count": 2
+  }
+}

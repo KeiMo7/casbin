@@ -1,0 +1,23 @@
+{
+  "name": "domain-cross-link",
+  "model": "domain_model.conf",
+  "current": [
+    "p, role:reader, domain2, data2, read",
+    "g, alice, role:reader, domain1"
+  ],
+  "candidate": [
+    "p, role:reader, domain2, data2, read",
+    "g, alice, role:reader, domain1",
+    "g, alice, role:reader, domain2"
+  ],
+  "expect": {
+    "flips": [
+      {
+        "request": ["alice", "domain2", "data2", "read"],
+        "direction": "deny->allow",
+        "causes": [{"section": "g", "ptype": "g", "rule": ["alice", "role:reader", "domain2"]}]
+      }
+    ],
+    "flip_count": 1
+  }
+}

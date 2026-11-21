@@ -1,0 +1,25 @@
+{
+  "name": "priority-implicit-order",
+  "model": "priority_model.conf",
+  "current": [
+    "p, team, data1, read, allow",
+    "p, alice, data1, read, allow",
+    "g, alice, team"
+  ],
+  "candidate": [
+    "p, alice, data1, read, deny",
+    "p, team, data1, read, allow",
+    "p, alice, data1, read, allow",
+    "g, alice, team"
+  ],
+  "expect": {
+    "flips": [
+      {
+        "request": ["alice", "data1", "read"],
+        "direction": "allow->deny",
+        "causes": [{"section": "p", "ptype": "p", "rule": ["alice", "data1", "read", "deny"]}]
+      }
+    ],
+    "flip_count": 1
+  }
+}

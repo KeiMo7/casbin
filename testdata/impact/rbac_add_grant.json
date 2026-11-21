@@ -1,0 +1,24 @@
+{
+  "name": "rbac-add-grant",
+  "model": "rbac_model.conf",
+  "current": [
+    "p, role:reader, data1, read",
+    "g, alice, role:reader"
+  ],
+  "candidate": [
+    "p, role:reader, data1, read",
+    "g, alice, role:reader",
+    "p, alice, data2, read"
+  ],
+  "expect": {
+    "flips": [
+      {
+        "request": ["alice", "data2", "read"],
+        "direction": "deny->allow",
+        "causes": [{"section": "p", "ptype": "p", "rule": ["alice", "data2", "read"]}]
+      }
+    ],
+    "unchanged": 0,
+    "flip_count": 1
+  }
+}

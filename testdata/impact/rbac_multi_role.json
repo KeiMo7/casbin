@@ -1,0 +1,31 @@
+{
+  "name": "rbac-multi-role",
+  "model": "rbac_model.conf",
+  "current": [
+    "p, role:reader, data1, read",
+    "p, role:writer, data2, write",
+    "g, alice, role:reader"
+  ],
+  "candidate": [
+    "p, role:reader, data1, read",
+    "p, role:writer, data2, write",
+    "p, alice, data3, read",
+    "g, alice, role:reader",
+    "g, alice, role:writer"
+  ],
+  "expect": {
+    "flips": [
+      {
+        "request": ["alice", "data2", "write"],
+        "direction": "deny->allow",
+        "causes": [{"section": "g", "ptype": "g", "rule": ["alice", "role:writer"]}]
+      },
+      {
+        "request": ["alice", "data3", "read"],
+        "direction": "deny->allow",
+        "causes": [{"section": "p", "ptype": "p", "rule": ["alice", "data3", "read"]}]
+      }
+    ],
+    "flip_count": 2
+  }
+}

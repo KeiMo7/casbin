@@ -1,0 +1,17 @@
+{
+  "name": "custom-function",
+  "model": "custom_fn_model.conf",
+  "current": [
+    "p, team, data1, read"
+  ],
+  "candidate": [
+    "p, team, data1, read",
+    "p, team2, data2, read"
+  ],
+  "expect": {
+    "flips": [],
+    "uncertain": [
+      {"kind": "matcher-function", "dependency_contains": "belongsTo"}
+    ]
+  }
+}

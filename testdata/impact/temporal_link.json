@@ -1,0 +1,26 @@
+{
+  "name": "temporal-link",
+  "model": "temporal_model.conf",
+  "current": [
+    "p, role:admin, data1, read",
+    "g, alice, role:admin, 2020-01-01 00:00:00, 2020-01-02 00:00:00"
+  ],
+  "candidate": [
+    "p, role:admin, data1, read",
+    "p, role:admin, data2, read",
+    "g, alice, role:admin, 2020-01-01 00:00:00, 2020-01-02 00:00:00"
+  ],
+  "expect": {
+    "flips": [
+      {
+        "request": ["role:admin", "data2", "read"],
+        "direction": "deny->allow",
+        "causes": [{"section": "p", "ptype": "p", "rule": ["role:admin", "data2", "read"]}]
+      }
+    ],
+    "flip_count": 1,
+    "uncertain": [
+      {"kind": "link-condition", "request": ["alice", "data2", "read"], "dependency_contains": "conditional role"}
+    ]
+  }
+}

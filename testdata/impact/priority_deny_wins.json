@@ -1,0 +1,30 @@
+{
+  "name": "priority-deny-wins",
+  "model": "priority_model.conf",
+  "current": [
+    "p, alice, data1, read, allow",
+    "p, team, data1, read, allow",
+    "g, alice, team"
+  ],
+  "candidate": [
+    "p, team, data1, read, deny",
+    "p, alice, data1, read, allow",
+    "p, team, data1, read, allow",
+    "g, alice, team"
+  ],
+  "expect": {
+    "flips": [
+      {
+        "request": ["alice", "data1", "read"],
+        "direction": "allow->deny",
+        "causes": [{"section": "p", "ptype": "p", "rule": ["team", "data1", "read", "deny"]}]
+      },
+      {
+        "request": ["team", "data1", "read"],
+        "direction": "allow->deny",
+        "causes": [{"section": "p", "ptype": "p", "rule": ["team", "data1", "read", "deny"]}]
+      }
+    ],
+    "flip_count": 2
+  }
+}

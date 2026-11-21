@@ -1,0 +1,17 @@
+{
+  "name": "malformed-rule",
+  "model": "rbac_model.conf",
+  "current": [
+    "p, alice, data1, read"
+  ],
+  "candidate": [
+    "p, alice, data1, read",
+    "p, bob, data2"
+  ],
+  "expect": {
+    "failure": {
+      "stage": "rule",
+      "rule": ["bob", "data2"]
+    }
+  }
+}

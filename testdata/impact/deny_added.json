@@ -1,0 +1,31 @@
+{
+  "name": "deny-added",
+  "model": "rbac_deny_model.conf",
+  "current": [
+    "p, alice, data1, read, allow",
+    "p, team, data1, read, allow",
+    "g, alice, team"
+  ],
+  "candidate": [
+    "p, alice, data1, read, allow",
+    "p, team, data1, read, allow",
+    "p, bob, data1, read, deny",
+    "g, alice, team",
+    "g, alice, bob"
+  ],
+  "expect": {
+    "flips": [
+      {
+        "request": ["alice", "data1", "read"],
+        "direction": "allow->deny",
+        "causes_any_of": [
+          [
+            {"section": "p", "ptype": "p", "rule": ["bob", "data1", "read", "deny"]},
+            {"section": "g", "ptype": "g", "rule": ["alice", "bob"]}
+          ]
+        ]
+      }
+    ],
+    "flip_count": 1
+  }
+}
